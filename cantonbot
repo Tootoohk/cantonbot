@@ -13,12 +13,12 @@
 
     // --- 用户配置区域 ---
     const CONFIG = {
-        targetAddress: "cantonwallet-tootoo::122...288",
-        transferAmount: "0.000001",
-        password: "YOUR_PASSWORD_HERE",
-        hotkeyStart: "s", 
-        waitCheckInterval: 5 * 60 * 1000,
-        actionDelay: 1500
+        targetAddress: "cantonwallet-tootoo::122...288", // 接收转账的目标地址
+        transferAmount: "0.000001",                      // 每次转账金额
+        password: "YOUR_PASSWORD_HERE",                  // 交易密码
+        hotkeyStart: "s",                                // Alt+s 启停
+        waitCheckInterval: 5 * 60 * 1000,                // 余额不足挂机刷新间隔
+        actionDelay: 1500                                // 动作延迟
     };
 
     // --- 状态管理 ---
