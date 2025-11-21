@@ -1,0 +1,313 @@
+// ==UserScript==
+// @name         CantonLoop 自动转账助手
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @match        https://cantonloop.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- 用户配置区域 ---
+    const CONFIG = {
+        targetAddress: "cantonwallet-tootoo::122...288",
+        transferAmount: "0.000001",
+        password: "YOUR_PASSWORD_HERE",
+        hotkeyStart: "s", 
+        waitCheckInterval: 5 * 60 * 1000,
+        actionDelay: 1500
+    };
+
+    // --- 状态管理 ---
+    const STATE = { STOPPED: 0, RUNNING: 1, WAITING_FOR_BALANCE: 2 };
+    let currentStatus = GM_getValue('scriptStatus', STATE.STOPPED);
+    let nextRefreshTime = GM_getValue('nextRefreshTime', 0);
+
+    // --- UI ---
+    const uiBox = document.createElement('div');
+    Object.assign(uiBox.style, {
+        position: 'fixed', bottom: '20px', right: '20px', padding: '10px',
+        background: 'rgba(0,0,0,0.85)', color: '#fff', zIndex: '999999',
+        borderRadius: '8px', fontSize: '13px', fontFamily: 'monospace',
+        border: '1px solid #666'
+    });
+    document.body.appendChild(uiBox);
+
+    function updateUI(text) {
+        const statusIcon = currentStatus === STATE.RUNNING ? "🟢" : (currentStatus === STATE.WAITING_FOR_BALANCE ? "⏳" : "🔴");
+        uiBox.innerHTML = `<div><strong>CantonBot ${statusIcon}</strong></div>
+                           <div style="margin-top:5px;">${text}</div>`;
+    }
+
+    function setNativeValue(element, value) {
+        const lastValue = element.value;
+        element.value = value;
+        const tracker = element._valueTracker;
+        if (tracker) {
+            tracker.setValue(lastValue);
+        }
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // --- 功能模块 ---
+
+    // 1. 密码处理
+    async function handlePasswordModal() {
+        const passwordInput = document.querySelector('input[type="password"]');
+        
+        // 查找所有可见的 Continue 按钮
+        const continueBtns = Array.from(document.querySelectorAll('button'))
+            .filter(b => b.innerText.includes('Continue') && b.offsetParent !== null);
+
+        if (passwordInput && continueBtns.length > 0) {
+            if (passwordInput.offsetParent !== null) {
+                
+                // 如果还没输入密码，才输入
+                if (passwordInput.value !== CONFIG.password) {
+                    updateUI("输入密码...");
+                    setNativeValue(passwordInput, CONFIG.password);
+                    await sleep(500); // 给一点时间让React反应
+                }
+
+                const targetBtn = continueBtns[continueBtns.length - 1];
+                
+                if (!targetBtn.disabled) {
+                    updateUI("点击 Continue...");
+                    targetBtn.click();
+                    await sleep(2000); // 等待处理
+                    return true;
+                } else {
+                    updateUI("尝试激活按钮...");
+                    passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    await sleep(500);
+                }
+            }
+        }
+        return false;
+    }
+
+    // 2. 待确认交易
+    async function processPendingTransactions() {
+        const pendingItems = document.querySelectorAll('div._pendingTransferItem_1kieh_31');
+        if (pendingItems.length > 0) {
+            const acceptBtn = Array.from(pendingItems[0].querySelectorAll('button')).find(b => b.innerText.trim() === 'Accept');
+            if (acceptBtn) {
+                updateUI("点击 Accept...");
+                acceptBtn.click();
+                await sleep(1500);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 3. 转账流程 (优先级逻辑：Confirm > Address > Amount)
+    async function processSendingFlow() {
+        
+        // [优先级 1] 最终确认 (Confirm)
+        const confirmBtn = document.getElementById('confirmSendButton') || 
+                           Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === 'Confirm');
+        
+        if (confirmBtn) {
+            updateUI("步骤: 点击 Confirm...");
+            confirmBtn.click();
+            await sleep(2000);
+            return;
+        }
+
+        // [优先级 2] 输入地址
+        const recipientInput = document.querySelector('input#recipient');
+        if (recipientInput) {
+            updateUI("步骤: 输入地址...");
+            setNativeValue(recipientInput, CONFIG.targetAddress);
+            await sleep(500);
+            const nextBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('Next'));
+            if (nextBtn) { nextBtn.click(); await sleep(CONFIG.actionDelay); return; }
+        }
+
+        // [优先级 3] 输入金额
+        const amountInput = document.querySelector('input#value');
+        if (amountInput) {
+            // --- 币种纠错 Start ---
+            const tokenSelector = document.querySelector('button._wrapper_1og66_9._transparent_1og66_16');
+            if (tokenSelector) {
+                const symbolSpan = tokenSelector.querySelector('span._symbol_1og66_67');
+                if (symbolSpan && symbolSpan.innerText.trim() !== 'CBTC') {
+                    updateUI("纠错: 切换回 CBTC...");
+                    tokenSelector.click();
+                    await sleep(1000);
+                    // 在弹窗列表里找 CBTC
+                    const modal = document.querySelector('div._modalContent_16jqu_23'); // 这里的类名如果变了也没事，下面是全局找
+                    const allTokenBtns = document.querySelectorAll('button._wrapper_1og66_9'); 
+                    for (let btn of allTokenBtns) {
+                         // 必须是弹窗里的（有父级 modal 或只是简单的可见性判断）
+                         if (btn.offsetParent !== null && btn.querySelector('span._symbol_1og66_67')?.innerText.trim() === 'CBTC') {
+                             btn.click();
+                             await sleep(1500);
+                             break;
+                         }
+                    }
+                    return;
+                }
+            }
+            // --- 币种纠错 End ---
+
+            // 余额检查
+            const availableBtn = document.querySelector('button._availableValue_1u2j6_116');
+            if (availableBtn) {
+                 const availableText = availableBtn.innerText.replace(/[^0-9.]/g, '');
+                 if (parseFloat(availableText) < parseFloat(CONFIG.transferAmount)) {
+                     updateUI("余额不足，返回挂机...");
+                     startWaiting();
+                     window.location.href = "https://cantonloop.com/dashboard";
+                     return;
+                 }
+            }
+
+            updateUI("步骤: 输入金额...");
+            setNativeValue(amountInput, CONFIG.transferAmount);
+            await sleep(800);
+            
+            const continueBtns = Array.from(document.querySelectorAll('button')).filter(b => b.innerText.includes('Continue') && !b.disabled);
+            if (continueBtns.length > 0) {
+                // 点击页面上最后一个可见的 Continue
+                continueBtns[continueBtns.length - 1].click();
+                await sleep(CONFIG.actionDelay);
+                return;
+            }
+        }
+    }
+
+    // 4. 辅助函数：找 CBTC 按钮
+    function findCBTCButton() {
+        const buttons = document.querySelectorAll('button._wrapper_1og66_9');
+        for (let btn of buttons) {
+            if (btn.classList.contains('_transparent_1og66_16')) continue; 
+            const symbol = btn.querySelector('span._symbol_1og66_67');
+            if (symbol && symbol.innerText.trim() === 'CBTC') {
+                return btn;
+            }
+        }
+        return null;
+    }
+
+    function startWaiting() {
+        currentStatus = STATE.WAITING_FOR_BALANCE;
+        nextRefreshTime = Date.now() + CONFIG.waitCheckInterval;
+        GM_setValue('scriptStatus', currentStatus);
+        GM_setValue('nextRefreshTime', nextRefreshTime);
+    }
+
+    // --- 主循环 ---
+    async function mainLoop() {
+        if (currentStatus === STATE.STOPPED) {
+            updateUI("已停止 (Alt+s 启动)");
+            return;
+        }
+
+        if (currentStatus === STATE.WAITING_FOR_BALANCE) {
+            const remaining = Math.ceil((nextRefreshTime - Date.now()) / 1000);
+            if (remaining <= 0) {
+                currentStatus = STATE.RUNNING;
+                GM_setValue('scriptStatus', STATE.RUNNING);
+                window.location.reload();
+            } else {
+                updateUI(`余额不足，挂机: ${remaining}s`);
+            }
+            return;
+        }
+
+        // 1. 全局检测密码框 (优先级最高)
+        if (await handlePasswordModal()) return;
+
+        // 2. 全局检测 Confirm 按钮 (优先级次高，防止卡死)
+        if (document.getElementById('confirmSendButton')) {
+            await processSendingFlow();
+            return;
+        }
+
+        // 3. 处理 Dashboard 待确认列表
+        const pendingList = document.querySelector('div._listWrapper_1kieh_17');
+        if (pendingList) {
+            if (await processPendingTransactions()) return;
+            // 如果列表还在但没Accept了，可能是状态没刷新，重载
+            if (document.querySelectorAll('div._pendingTransferItem_1kieh_31').length === 0) {
+                window.location.reload();
+                return;
+            }
+        }
+
+        // 路径判断
+        const isDashboard = window.location.href.includes('/dashboard') && !document.querySelector('input#recipient');
+        const isSendPage = document.querySelector('input#recipient') || document.querySelector('input#value');
+        
+        // 4. Dashboard -> 进详情页
+        if (isDashboard) {
+            const cbtcBtn = findCBTCButton();
+            if (cbtcBtn) {
+                // 简单余额预检
+                const amountSpan = cbtcBtn.querySelector('span._amount_1og66_77');
+                if (amountSpan) {
+                    const bal = parseFloat(amountSpan.innerText.replace(/[^0-9.]/g, ''));
+                    if (bal < parseFloat(CONFIG.transferAmount)) {
+                        updateUI(`首页余额不足(${bal})，挂机...`);
+                        startWaiting();
+                        return;
+                    }
+                }
+                updateUI("点击 CBTC...");
+                cbtcBtn.click();
+                await sleep(2000);
+                return;
+            }
+        }
+
+        // 5. 详情页 -> 点击 Send
+        const sendBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === 'Send');
+        if (sendBtn && !isSendPage && !document.getElementById('confirmSendButton')) {
+             const detailBalance = document.querySelector('section._heroCard_1h6wr_81 dd');
+             if (detailBalance) {
+                 const bal = parseFloat(detailBalance.innerText.replace(/[^0-9.]/g, ''));
+                 if (bal < parseFloat(CONFIG.transferAmount)) {
+                     updateUI("详情页余额不足，返回挂机...");
+                     startWaiting();
+                     window.location.href = "https://cantonloop.com/dashboard";
+                     return;
+                 }
+             }
+             updateUI("点击 Send...");
+             sendBtn.click();
+             await sleep(2000);
+             return;
+        }
+
+        // 6. 发送流程 (地址 -> 金额 -> 确认)
+        if (isSendPage) {
+            await processSendingFlow();
+        }
+    }
+
+    // 键盘监听
+    document.addEventListener('keydown', (e) => {
+        if (e.altKey && e.key.toLowerCase() === CONFIG.hotkeyStart) {
+            if (currentStatus === STATE.STOPPED) {
+                currentStatus = STATE.RUNNING;
+                GM_setValue('scriptStatus', STATE.RUNNING);
+                updateUI("启动中...");
+                setTimeout(() => window.location.reload(), 500);
+            } else {
+                currentStatus = STATE.STOPPED;
+                GM_setValue('scriptStatus', STATE.STOPPED);
+                updateUI("已停止");
+            }
+        }
+    });
+
+    setInterval(mainLoop, 1500);
+
+})();
