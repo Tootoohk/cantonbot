@@ -1,0 +1,46 @@
+(function() {
+    'use strict';
+
+    console.log("✅ 自动确认脚本已启动...");
+    console.log("正在扫描页面中的“确认”按钮...");
+
+    // 防止重复点击的标志位
+    let isClicking = false;
+
+    setInterval(() => {
+        // 如果当前正在执行点击流程，则跳过本次扫描
+        if (isClicking) return;
+
+        // 1. 查找按钮
+        // 策略：查找所有 button 元素，并筛选出包含“确认”文字的按钮
+        // 这种方法比直接使用 class="sc-..." 更稳定，因为那些随机字符可能会变
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const confirmBtn = buttons.find(btn => btn.innerText.includes('确认'));
+        
+        // 如果你想严格匹配你提供的 HTML 结构中的特定 Class，可以使用下面这行代替上面两行：
+        // const confirmBtn = document.querySelector('.sc-iTONeN.jEEuKd'); 
+
+        // 2. 如果找到了按钮
+        if (confirmBtn) {
+            console.log("🔎 检测到确认弹窗！");
+            isClicking = true; // 标记为正在处理，防止下一次循环重复触发
+
+            // 3. 等待 1 秒后点击
+            setTimeout(() => {
+                // 点击前再次检查元素是否存在（防止 1 秒内弹窗已关闭导致报错）
+                if (document.body.contains(confirmBtn)) {
+                    confirmBtn.click();
+                    console.log("🖱 已自动点击“确认”");
+                } else {
+                    console.log("⚠️ 按钮在点击前已消失");
+                }
+
+                // 点击动作完成后，稍作延迟再释放锁，给页面一点反应时间
+                setTimeout(() => {
+                    isClicking = false;
+                }, 500);
+
+            }, 1000); // 这里设置等待 1000 毫秒 (1秒)
+        }
+    }, 1000); // 这里设置扫描间隔为 1000 毫秒 (1秒)
+})();
