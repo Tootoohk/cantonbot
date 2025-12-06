@@ -1,0 +1,383 @@
+// ==UserScript==
+// @name         HandlPay Auto Transfer Bot (Infinite Loop)
+// @namespace    http://tampermonkey.net/
+// @version      1.8
+// @description  Automate payment. PERSISTENT RUNNING: Auto-restarts after refresh/error until manually stopped.
+// @author       Gemini Business
+// @match        https://app.handlpay.com/pay/*
+// @match        https://app.handlpay.com/payment_complete/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // === 配置区域 ===
+    const CONFIG = {
+        AMOUNT: "5",
+        WATCHDOG_TIMEOUT: 60000,
+        RETRY_DELAY: 500,
+        ERROR_WAIT: 1000
+    };
+
+    // === 状态管理 ===
+    // 注意：isRunning 现在直接从存储中读取，不再只是内存变量
+    const STATE = {
+        get isRunning() { return GM_getValue('bot_is_running', false); }, // 获取持久化状态
+        set isRunning(val) { GM_setValue('bot_is_running', val); },       // 保存持久化状态
+        isPaymentPending: false,
+        isWaitingForFees: false,
+        count: parseInt(GM_getValue('transfer_count', 0)),
+        watchdogTimer: null,
+        startTime: parseInt(GM_getValue('bot_start_time', 0)) // 保存开始时间以便刷新后继续计时
+    };
+
+    // === 通讯频道 ===
+    const botChannel = new BroadcastChannel('handlpay_bot_channel');
+
+    // === 页面路由判断 ===
+    const currentURL = window.location.href;
+
+    // 场景1: 支付成功页面
+    if (currentURL.includes('/payment_complete/')) {
+        console.log('✅ Payment Complete Page Detected.');
+        botChannel.postMessage({ type: 'PAYMENT_SUCCESS' });
+        setTimeout(() => { window.close(); }, 100);
+        return;
+    }
+
+    // 场景2: 支付主页面
+    if (currentURL.includes('/pay/')) {
+        // 页面加载时，检查是否处于“开启”状态，如果是，自动启动
+        if (STATE.isRunning) {
+            console.log('🔄 Bot was running before reload. Auto-resuming...');
+            initMainScript(true); // true 表示自动启动
+        } else {
+            initMainScript(false);
+        }
+    }
+
+    function initMainScript(autoStart) {
+        createUI();
+        bindKeys();
+
+        if (autoStart) {
+            startBotInternal();
+        }
+
+        // 监听成功信号
+        botChannel.onmessage = (event) => {
+            if (event.data && event.data.type === 'PAYMENT_SUCCESS') {
+                if (STATE.isRunning) {
+                    console.log('📡 Signal received: Payment Success.');
+                    updateCount();
+                    unlockBot();
+                }
+            }
+        };
+
+        // 监听焦点回归
+        window.onfocus = () => {
+            if (STATE.isRunning && STATE.isPaymentPending) {
+                // 焦点回来时，不盲目解锁，而是等待一小会看页面是否重置
+                setTimeout(() => { unlockBot(); }, 500);
+            }
+        };
+
+        const originalOpen = window.open;
+        window.open = function(...args) {
+            if (STATE.isRunning) console.log('🚀 New window opening detected.');
+            return originalOpen.apply(this, args);
+        };
+    }
+
+    function unlockBot() {
+        STATE.isPaymentPending = false;
+        STATE.isWaitingForFees = false;
+        resetWatchdog();
+        updateUI();
+        requestAnimationFrame(processLoop);
+    }
+
+    // === UI 创建 ===
+    function createUI() {
+        const div = document.createElement('div');
+        div.id = 'bot-stats-panel';
+        div.innerHTML = `
+            <div style="font-weight:bold; margin-bottom:4px;">🤖 Infinite Bot V1.8</div>
+            <div>Status: <span id="bot-status" style="color:red;">STOPPED</span></div>
+            <div>State: <span id="bot-state" style="color:#aaa;">IDLE</span></div>
+            <div>Count: <span id="bot-count">${STATE.count}</span></div>
+            <div>Time: <span id="bot-timer">00:00:00</span></div>
+        `;
+        GM_addStyle(`
+            #bot-stats-panel {
+                position: fixed; top: 20px; left: 20px;
+                background: rgba(0, 0, 0, 0.85); color: white;
+                padding: 10px 15px; border-radius: 8px; z-index: 99999;
+                font-family: monospace; font-size: 12px;
+                pointer-events: none; border: 1px solid #444;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.5);
+            }
+        `);
+        document.body.appendChild(div);
+        updateUI(); // 初始化显示
+        if (STATE.isRunning) setInterval(updateTimer, 1000); // 如果自动启动，开启计时器
+    }
+
+    function updateUI() {
+        const statusEl = document.getElementById('bot-status');
+        const countEl = document.getElementById('bot-count');
+        const stateEl = document.getElementById('bot-state');
+
+        if (statusEl) {
+            statusEl.innerText = STATE.isRunning ? 'RUNNING (PERSISTENT)' : 'STOPPED';
+            statusEl.style.color = STATE.isRunning ? '#0f0' : 'red';
+        }
+        if (countEl) countEl.innerText = STATE.count;
+        if (stateEl) {
+            if (!STATE.isRunning) stateEl.innerText = "IDLE";
+            else if (STATE.isPaymentPending) {
+                stateEl.innerText = "⏳ PENDING";
+                stateEl.style.color = "yellow";
+            } else if (STATE.isWaitingForFees) {
+                stateEl.innerText = "🔍 WAITING FEES";
+                stateEl.style.color = "orange";
+            } else {
+                stateEl.innerText = "⚡ SEARCHING";
+                stateEl.style.color = "#0ff";
+            }
+        }
+    }
+
+    function updateTimer() {
+        if (!STATE.isRunning) return;
+        // 如果没有开始时间（比如刚手动清除），重置一下
+        if (!STATE.startTime) STATE.startTime = Date.now();
+
+        const now = Date.now();
+        const diff = now - STATE.startTime;
+        const h = Math.floor(diff / 3600000).toString().padStart(2, '0');
+        const m = Math.floor((diff % 3600000) / 60000).toString().padStart(2, '0');
+        const s = Math.floor((diff % 60000) / 1000).toString().padStart(2, '0');
+        const timerEl = document.getElementById('bot-timer');
+        if (timerEl) timerEl.innerText = `${h}:${m}:${s}`;
+    }
+
+    function updateCount() {
+        STATE.count++;
+        GM_setValue('transfer_count', STATE.count);
+        updateUI();
+    }
+
+    function bindKeys() {
+        document.addEventListener('keydown', (e) => {
+            if (e.altKey && e.code === 'KeyS') {
+                e.preventDefault();
+                toggleBot();
+            }
+        });
+    }
+
+    // 内部启动函数
+    function startBotInternal() {
+        if (!STATE.startTime) {
+            STATE.startTime = Date.now();
+            GM_setValue('bot_start_time', STATE.startTime);
+        }
+        STATE.isPaymentPending = false;
+        STATE.isWaitingForFees = false;
+        setInterval(updateTimer, 1000);
+        resetWatchdog();
+        processLoop();
+        updateUI();
+    }
+
+    function toggleBot() {
+        // 切换状态
+        const newState = !STATE.isRunning;
+        STATE.isRunning = newState;
+
+        if (newState) {
+            // 手动开启，重置开始时间
+            STATE.startTime = Date.now();
+            GM_setValue('bot_start_time', STATE.startTime);
+            startBotInternal();
+        } else {
+            // 手动停止
+            clearTimeout(STATE.watchdogTimer);
+            STATE.isPaymentPending = false;
+            location.reload(); // 停止时刷新一下清理状态，比较干净
+        }
+        updateUI();
+    }
+
+    function resetWatchdog() {
+        if (STATE.watchdogTimer) clearTimeout(STATE.watchdogTimer);
+        if (!STATE.isRunning) return;
+        STATE.watchdogTimer = setTimeout(() => {
+            console.warn('Watchdog Timeout. Refreshing to restart...');
+            location.reload();
+        }, CONFIG.WATCHDOG_TIMEOUT);
+    }
+
+    // === 错误处理 ===
+    async function checkAndHandleError() {
+        const okBtns = Array.from(document.querySelectorAll('button.tm-button.black.narrow.horizontal'));
+        const okBtn = okBtns.find(btn => btn.textContent.trim() === 'Ok');
+
+        if (okBtn) {
+            const container = okBtn.closest('div');
+            // 简单放宽检查条件，只要是这个按钮结构，大概率就是报错
+            if (container) {
+                console.log('⚠️ Error Popup detected. Clicking OK...');
+                okBtn.click();
+
+                // 点击OK后，强制解锁，让processLoop依靠页面元素来决定下一步
+                STATE.isPaymentPending = false;
+                STATE.isWaitingForFees = false;
+                updateUI();
+                await sleep(CONFIG.ERROR_WAIT);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // === 费用加载检查 ===
+    function areFeesLoaded() {
+        const feeLabels = Array.from(document.querySelectorAll('span'));
+        const feeLabel = feeLabels.find(el => el.textContent.includes('Network fees'));
+        if (!feeLabel) return true;
+        const wrapper = feeLabel.closest('div').parentElement;
+        if (wrapper) {
+            const text = wrapper.innerText;
+            if (text.includes('USDC')) return true;
+            else return false;
+        }
+        return true;
+    }
+
+    // === 核心：智能循环 ===
+    async function processLoop() {
+        if (!STATE.isRunning) return;
+
+        // 1. 错误检测 (最高优先级)
+        if (await checkAndHandleError()) {
+             requestAnimationFrame(processLoop);
+             return;
+        }
+
+        try {
+            // === 智能复位检查 (你要求的逻辑) ===
+            // 无论当前脚本处于什么状态（Pending也好，Waiting也好）
+            // 只要页面上出现了初始的“金额输入框”，就意味着页面已经回到了起点。
+            // 此时必须强制复位所有锁，开始新一轮填表。
+            const input = document.querySelector('input[id*=":r3:"]');
+
+            if (input && !input.disabled) {
+                // 如果当前被锁住了，说明状态不一致（比如报错后页面重置了，但锁没开）
+                if (STATE.isPaymentPending || STATE.isWaitingForFees) {
+                    console.log('🔄 Detected Start Screen while Locked. Force Resetting State.');
+                    STATE.isPaymentPending = false;
+                    STATE.isWaitingForFees = false;
+                    updateUI();
+                }
+
+                // 执行第一步：填金额
+                if (!input.value || input.value !== CONFIG.AMOUNT) {
+                    console.log('📝 Step 1: Input Amount');
+                    fillReactInput(input, CONFIG.AMOUNT);
+                    await sleep(300);
+                }
+            }
+
+            // 如果处于 Pending 状态且没有回到起点，则跳过后续步骤（等待中）
+            if (STATE.isPaymentPending) {
+                requestAnimationFrame(processLoop);
+                return;
+            }
+
+            // --- 步骤 2: Select method ---
+            const nextBtn = document.querySelector('button.tm-button.black');
+            if (nextBtn && !nextBtn.disabled && nextBtn.textContent.includes('Select method')) {
+                // 双重确认：只有在输入了正确金额后才点击
+                if (input && input.value === CONFIG.AMOUNT) {
+                    nextBtn.click();
+                    await sleep(500);
+                }
+            }
+
+            // --- 步骤 3: 确保 Crypto 被选中 ---
+            const cryptoRadio = document.querySelector('input[name="payment-type"]');
+            if (cryptoRadio && !cryptoRadio.checked) {
+                 cryptoRadio.click();
+                 await sleep(300);
+            }
+
+            // --- 步骤 4: Pay with crypto ---
+            const payWithCryptoBtn = document.querySelector('button.tm-button.black.vertical');
+            if (payWithCryptoBtn) {
+                payWithCryptoBtn.click();
+                await sleep(1000);
+            }
+
+            // --- 步骤 5: 最终 Pay 按钮 ---
+            const finalPayBtn = Array.from(document.querySelectorAll('button.tm-button.black'))
+                .find(btn => btn.textContent.trim() === 'Pay');
+
+            if (finalPayBtn) {
+                // 费用加载检查
+                if (!areFeesLoaded()) {
+                    if (!STATE.isWaitingForFees) {
+                        STATE.isWaitingForFees = true;
+                        updateUI();
+                    }
+                    requestAnimationFrame(processLoop);
+                    return;
+                }
+
+                // 按钮可用性检查
+                if (finalPayBtn.disabled) {
+                     requestAnimationFrame(processLoop);
+                     return;
+                }
+
+                STATE.isWaitingForFees = false;
+
+                // 滚动并点击
+                finalPayBtn.scrollIntoView({block: "center", inline: "nearest"});
+
+                console.log('👆 Clicking Final Pay...');
+                STATE.isPaymentPending = true;
+                updateUI();
+
+                finalPayBtn.click();
+            }
+
+        } catch (e) {
+            console.error(e);
+        }
+
+        if (STATE.isRunning) {
+            requestAnimationFrame(processLoop);
+        }
+    }
+
+    // === 辅助函数 ===
+    function fillReactInput(element, value) {
+        const lastValue = element.value;
+        element.value = value;
+        const event = new Event('input', { bubbles: true });
+        const tracker = element._valueTracker;
+        if (tracker) tracker.setValue(lastValue);
+        element.dispatchEvent(event);
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+})();
